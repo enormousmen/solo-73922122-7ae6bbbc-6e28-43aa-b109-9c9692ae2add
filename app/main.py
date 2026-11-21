@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .config import Settings
 from .db import LeaseError, Store
+from .routing import RouteSpec
 
 DESCRIPTION = """
 Single-subnet IPv4 DHCP-style lease API.
@@ -25,6 +26,11 @@ Single-subnet IPv4 DHCP-style lease API.
   released but not renewed.
 * **Pool switch** (`PUT /v1/pool`) is atomic: it either fully commits or the
   previous pool keeps serving.  The pool and all leases survive restarts.
+* **Guarded pool switch** (`PUT /v1/pool/guarded`) also takes headquarters'
+  forwarding table and this branch's next hop, and only switches when the
+  longest-prefix match returns every target-pool address and every still-valid
+  lease to this branch.  Otherwise it keeps the old pool and reports the
+  affected target-pool segments and lease ids.
 * **Operators** (`GET /v1/admin/out-of-pool`) can list still-occupied
   addresses that lie outside the current pool, with their expiry times.
 """
@@ -57,15 +63,34 @@ class PoolRequest(BaseModel):
     cidr: str = Field(min_length=1, max_length=32)
 
 
-class ErrorBody(BaseModel):
-    code: str
-    message: str
+class RouteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    prefix: str = Field(min_length=1, max_length=32)
+    next_hop: str | None = Field(default=None, max_length=64)
+    discard: bool = False
 
 
-def error_response(status_code: int, code: str, message: str) -> JSONResponse:
+class GuardedPoolRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    cidr: str = Field(min_length=1, max_length=32)
+    next_hop: str = Field(min_length=1, max_length=64)
+    routes: list[RouteRequest] = Field(default_factory=list, max_length=128)
+
+
+def error_response(
+    status_code: int,
+    code: str,
+    message: str,
+    details: dict[str, Any] | None = None,
+) -> JSONResponse:
+    body: dict[str, Any] = {"code": code, "message": message}
+    if details is not None:
+        body["details"] = details
     return JSONResponse(
         status_code=status_code,
-        content={"error": ErrorBody(code=code, message=message).model_dump()},
+        content={"error": body},
     )
 
 
@@ -101,7 +126,7 @@ def create_app(settings: Settings | None = None, store: Store | None = None) -> 
 
     @app.exception_handler(LeaseError)
     async def handle_lease_error(_: Request, exc: LeaseError) -> JSONResponse:
-        return error_response(exc.status_code, exc.code, exc.message)
+        return error_response(exc.status_code, exc.code, exc.message, exc.details)
 
     @app.exception_handler(RequestValidationError)
     async def handle_validation_error(
@@ -137,6 +162,25 @@ def create_app(settings: Settings | None = None, store: Store | None = None) -> 
         _: None = Depends(require_operator),
     ) -> dict[str, Any]:
         return store.switch_pool(body.cidr)
+
+    @app.put(
+        "/v1/pool/guarded",
+        tags=["pool"],
+        summary="Switch the pool only if headquarters routes everything back (operator)",
+        responses={
+            409: {"description": "Target pool or live lease not routed to this branch"},
+        },
+    )
+    def put_pool_guarded(
+        body: GuardedPoolRequest,
+        store: Store = Depends(get_store),
+        _: None = Depends(require_operator),
+    ) -> dict[str, Any]:
+        routes = [
+            RouteSpec(prefix=route.prefix, next_hop=route.next_hop, discard=route.discard)
+            for route in body.routes
+        ]
+        return store.guarded_switch_pool(body.cidr, body.next_hop, routes)
 
     # ---------------------------------------------------------------- leases
 

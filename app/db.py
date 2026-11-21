@@ -6,7 +6,9 @@ Every mutating operation runs inside ``BEGIN IMMEDIATE``, which takes
 SQLite's database-wide write lock up front.  Writers therefore execute one
 at a time, and because the pool switch is a single transaction, a switch
 racing with acquire/renew/release always yields the state of some serial
-execution order of the two.
+execution order of the two.  The guarded switch performs its routing check
+and the pool change inside that same transaction, so it is equally
+serialisable with any other writer.
 
 Reads use a short deferred transaction so that multi-statement reports see
 one consistent snapshot even while a switch commits.
@@ -26,15 +28,16 @@ import ipaddress
 import sqlite3
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import subnets
+from . import routing, subnets
 from .config import Settings
+from .routing import RouteSpec, RoutingError
 from .subnets import PoolError
 
 SCHEMA = """
@@ -68,7 +71,9 @@ CREATE TABLE IF NOT EXISTS pool_changes (
     change_id      INTEGER PRIMARY KEY AUTOINCREMENT,
     previous_cidr  TEXT,
     new_cidr       TEXT NOT NULL,
-    changed_at     REAL NOT NULL
+    changed_at     REAL NOT NULL,
+    branch_next_hop TEXT,
+    table_routes   INTEGER
 );
 """
 
@@ -76,11 +81,18 @@ CREATE TABLE IF NOT EXISTS pool_changes (
 class LeaseError(Exception):
     """Domain error carrying an HTTP status and a stable machine code."""
 
-    def __init__(self, status_code: int, code: str, message: str) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        code: str,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.code = code
         self.message = message
+        self.details = details
 
 
 def iso(epoch: float) -> str:
@@ -186,8 +198,23 @@ class Store:
                 )
             else:
                 self._pool = subnets.parse_pool_cidr(row["value"])
+            self._migrate_pool_changes(conn)
         finally:
             conn.close()
+
+    @staticmethod
+    def _migrate_pool_changes(conn: sqlite3.Connection) -> None:
+        """Add the guarded-switch audit columns to databases created earlier."""
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(pool_changes)").fetchall()
+        }
+        for name, ddl in (
+            ("branch_next_hop", "TEXT"),
+            ("table_routes", "INTEGER"),
+        ):
+            if name not in columns:
+                conn.execute(f"ALTER TABLE pool_changes ADD COLUMN {name} {ddl}")
 
     @contextmanager
     def _write(self) -> Iterator[sqlite3.Connection]:
@@ -493,5 +520,99 @@ class Store:
             "previous_cidr": str(previous),
             "changed": True,
             "changed_at": iso(now),
+            **counts,
+        }
+
+    def guarded_switch_pool(
+        self,
+        cidr: str,
+        next_hop: str,
+        routes: Sequence[RouteSpec],
+    ) -> dict[str, Any]:
+        """Switch pools only if the headquarters table returns all traffic here.
+
+        The check and the switch form one ``BEGIN IMMEDIATE`` transaction.  A
+        concurrent acquire/renew/release/switch therefore observes the state
+        of a serial order: either it ran before this check (its lease is part
+        of the validated set) or after the committed switch.
+
+        The target pool is validated by prefix arithmetic only; the work is
+        proportional to the (<=128 entry) table and the number of leases,
+        never to the size of the target pool.
+        """
+        try:
+            target = subnets.parse_pool_cidr(cidr)
+        except PoolError as exc:
+            raise LeaseError(422, "invalid_pool", str(exc)) from exc
+        try:
+            branch_hop = routing.parse_branch_next_hop(next_hop)
+            table = routing.parse_table(routes)
+        except RoutingError as exc:
+            raise LeaseError(422, exc.code, str(exc)) from exc
+
+        now = self.clock()
+        with self._write() as conn:
+            self._sweep_expired(conn, now)
+            previous = self._current_pool(conn)
+            active = self._active_rows(conn, now)
+            first, last = subnets.usable_bounds(target)
+            segments, uncovered_count = table.uncovered_segments(
+                first, last, branch_hop
+            )
+            affected = sorted(
+                row["lease_id"]
+                for row in active
+                if not table.points_to(row["ip"], branch_hop)
+            )
+
+            if segments or affected:
+                # Keep the old pool: nothing is written, so the rejected check
+                # and the concurrent operations remain a serial execution.
+                raise LeaseError(
+                    409,
+                    "switch_blocked",
+                    f"{uncovered_count} usable address(es) in {target} and "
+                    f"{len(affected)} active lease(s) are not routed to "
+                    f"{branch_hop}; the pool was not changed",
+                    details={
+                        "target_cidr": str(target),
+                        "current_pool_cidr": str(previous),
+                        "branch_next_hop": str(branch_hop),
+                        "affected_segments": [str(net) for net in segments],
+                        "affected_address_count": uncovered_count,
+                        "affected_lease_ids": affected,
+                    },
+                )
+
+            changed = previous != target
+            if changed:
+                conn.execute(
+                    "UPDATE settings SET value = ? WHERE key = 'current_pool'",
+                    (str(target),),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO pool_changes(previous_cidr, new_cidr, changed_at,
+                                             branch_next_hop, table_routes)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (str(previous), str(target), now, str(branch_hop), len(table.routes)),
+                )
+            counts = self._counts(target, self._active_rows(conn, now))
+            live_leases = len(active)
+        return {
+            "cidr": str(target),
+            "previous_cidr": str(previous),
+            "changed": changed,
+            "changed_at": iso(now) if changed else None,
+            "branch_next_hop": str(branch_hop),
+            "table_routes": len(table.routes),
+            "validated": {
+                "target_usable_addresses": last - first + 1,
+                "checked_leases": live_leases,
+                "affected_segments": [],
+                "affected_address_count": 0,
+                "affected_lease_ids": [],
+            },
             **counts,
         }
